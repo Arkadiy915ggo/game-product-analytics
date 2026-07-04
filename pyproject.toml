@@ -1,0 +1,19 @@
+[project]
+name = "game-product-analytics"
+version = "0.1.0"
+description = "MVP platform for Steam game review product analytics"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.8.0",
+    "python-dotenv>=1.0.1",
+    "uvicorn[standard]>=0.30.0",
+]
+
+[project.scripts]
+game-analytics = "game_product_analytics.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
