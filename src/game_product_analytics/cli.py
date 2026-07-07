@@ -4,10 +4,12 @@ import argparse
 import asyncio
 import json
 from datetime import date
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 from game_product_analytics.pipeline import analyze_game_reviews
+from game_product_analytics.report import save_markdown_report
 from game_product_analytics.schemas import ReviewAnalysisRequest
 
 
@@ -18,8 +20,10 @@ def main() -> None:
     parser.add_argument("--app-id", type=int, help="Steam app id, skips search if provided")
     parser.add_argument("--start-date", type=date.fromisoformat, help="YYYY-MM-DD")
     parser.add_argument("--end-date", type=date.fromisoformat, help="YYYY-MM-DD")
-    parser.add_argument("--max-reviews", type=int, default=200)
+    parser.add_argument("--max-reviews", type=int, default=100)
     parser.add_argument("--language", default="all")
+    parser.add_argument("--out-dir", default="reports", help="Directory for .md reports (default: reports/)")
+    parser.add_argument("--json", action="store_true", help="Print raw JSON to stdout")
     args = parser.parse_args()
 
     request = ReviewAnalysisRequest(
@@ -31,7 +35,12 @@ def main() -> None:
         language=args.language,
     )
     response = asyncio.run(analyze_game_reviews(request))
-    print(json.dumps(response.model_dump(mode="json"), ensure_ascii=False, indent=2))
+
+    report_path = save_markdown_report(response, Path(args.out_dir))
+    print(f"Report saved: {report_path}")
+
+    if args.json:
+        print(json.dumps(response.model_dump(mode="json"), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

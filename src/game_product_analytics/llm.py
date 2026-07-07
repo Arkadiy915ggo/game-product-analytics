@@ -1,20 +1,221 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+from abc import ABC, abstractmethod
 from collections import Counter
 from typing import Any
 
 import httpx
 
+from game_product_analytics.config import Settings, load_settings
 from game_product_analytics.schemas import ReviewAnalysis, SentimentBreakdown, SteamReview
 
 
 SYSTEM_PROMPT = """You are a senior game product analyst.
-Analyze Steam reviews as product feedback. Return strict JSON only.
+Analyze Steam reviews as product feedback.
+Return strict JSON only.
 Do not wrap JSON in markdown.
 """
+
+
+class LLMClient(ABC):
+    @abstractmethod
+    async def complete(self, *, system: str, user: str) -> str:
+        raise NotImplementedError
+
+    async def unload(self) -> None:
+        return None
+
+
+class OpenAICompatibleClient(LLMClient):
+    def __init__(self, api_key: str, base_url: str, model: str) -> None:
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is required for LLM_PROVIDER=openai")
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+
+    async def complete(self, *, system: str, user: str) -> str:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                f"{self.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": self.model,
+                    "temperature": 0.2,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        return str(content or "").strip()
+
+
+class OllamaClient(LLMClient):
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        timeout_seconds: int,
+        keep_alive: str,
+        unload_after_task: bool,
+        num_ctx: int,
+        num_predict: int,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout_seconds = timeout_seconds
+        self.keep_alive = keep_alive
+        self.unload_after_task = unload_after_task
+        self.num_ctx = num_ctx
+        self.num_predict = num_predict
+
+    async def complete(self, *, system: str, user: str) -> str:
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.post(
+                f"{self.base_url}/api/chat",
+                json={
+                    "model": self.model,
+                    "stream": False,
+                    "keep_alive": self.keep_alive,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "options": {
+                        "temperature": 0.2,
+                        "num_ctx": self.num_ctx,
+                        "num_predict": self.num_predict,
+                    },
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+        total_duration = (data.get("total_duration") or 0) / 1_000_000_000
+        prompt_eval_count = data.get("prompt_eval_count") or 0
+        eval_count = data.get("eval_count") or 0
+        eval_duration = (data.get("eval_duration") or 0) / 1_000_000_000
+        tokens_per_second = eval_count / eval_duration if eval_duration else 0
+        logging.info(
+            "Ollama response model=%s total_s=%.1f prompt_tokens=%s eval_tokens=%s eval_tps=%.2f",
+            self.model,
+            total_duration,
+            prompt_eval_count,
+            eval_count,
+            tokens_per_second,
+        )
+        return str(data.get("message", {}).get("content", "")).strip()
+
+    async def unload(self) -> None:
+        if not self.unload_after_task:
+            return
+        async with httpx.AsyncClient(timeout=30) as client:
+            try:
+                response = await client.post(
+                    f"{self.base_url}/api/generate",
+                    json={"model": self.model, "prompt": "", "keep_alive": 0},
+                )
+                response.raise_for_status()
+            except Exception:  # noqa: BLE001
+                logging.exception("Failed to unload Ollama model %s", self.model)
+                return
+        logging.info("Ollama model unloaded model=%s", self.model)
+
+
+def build_llm_client(
+    settings: Settings,
+    *,
+    model: str | None = None,
+    provider: str | None = None,
+) -> LLMClient:
+    resolved = provider or settings.resolved_llm_provider
+    if resolved == "openai":
+        return OpenAICompatibleClient(
+            settings.openai_api_key,
+            settings.openai_base_url,
+            model or settings.openai_model,
+        )
+    if resolved == "ollama":
+        return OllamaClient(
+            settings.ollama_base_url,
+            model or settings.ollama_model,
+            settings.ollama_timeout_seconds,
+            settings.ollama_keep_alive,
+            settings.ollama_unload_after_task,
+            settings.ollama_num_ctx,
+            settings.ollama_num_predict,
+        )
+    raise RuntimeError(f"Unsupported LLM provider: {resolved}")
+
+
+async def analyze_reviews(reviews: list[SteamReview], settings: Settings | None = None) -> ReviewAnalysis:
+    if not reviews:
+        return ReviewAnalysis(
+            summary="No reviews found for the selected period.",
+            sentiment=SentimentBreakdown(positive=0, negative=0, positive_share=0.0),
+            top_likes=[],
+            top_pain_points=[],
+            feature_requests=[],
+            monetization_mentions=[],
+            technical_issues=[],
+            notable_quotes=[],
+        )
+
+    settings = settings or load_settings()
+    try:
+        client = build_llm_client(settings)
+        llm_text = await client.complete(system=SYSTEM_PROMPT, user=_build_user_prompt(reviews))
+        try:
+            await client.unload()
+        except Exception:  # noqa: BLE001
+            logging.debug("LLM unload failed; ignoring")
+        parsed = _parse_json_object(llm_text)
+        if parsed is None:
+            raise ValueError("LLM response was not valid JSON")
+        return _analysis_from_llm(parsed, reviews)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("LLM analysis failed, falling back to keyword analysis: %s", exc)
+        return fallback_analysis(reviews)
+
+
+def _build_user_prompt(reviews: list[SteamReview]) -> str:
+    payload = {
+        "task": "Analyze Steam reviews for game product analytics.",
+        "required_json_schema": {
+            "summary": "string: concise executive summary",
+            "top_likes": ["string"],
+            "top_pain_points": ["string"],
+            "feature_requests": ["string"],
+            "monetization_mentions": ["string"],
+            "technical_issues": ["string"],
+            "notable_quotes": ["string"],
+        },
+        "reviews": build_review_payload(reviews),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _analysis_from_llm(parsed: dict[str, Any], reviews: list[SteamReview]) -> ReviewAnalysis:
+    sentiment = _sentiment_from_reviews(reviews)
+    return ReviewAnalysis(
+        summary=str(parsed.get("summary") or "LLM analysis completed."),
+        sentiment=sentiment,
+        top_likes=_string_list(parsed.get("top_likes")),
+        top_pain_points=_string_list(parsed.get("top_pain_points")),
+        feature_requests=_string_list(parsed.get("feature_requests")),
+        monetization_mentions=_string_list(parsed.get("monetization_mentions")),
+        technical_issues=_string_list(parsed.get("technical_issues")),
+        notable_quotes=_string_list(parsed.get("notable_quotes")),
+        raw_llm_response=parsed,
+    )
 
 
 def build_review_payload(reviews: list[SteamReview], limit: int = 80) -> list[dict[str, Any]]:
@@ -31,81 +232,6 @@ def build_review_payload(reviews: list[SteamReview], limit: int = 80) -> list[di
     ]
 
 
-async def analyze_reviews(reviews: list[SteamReview]) -> ReviewAnalysis:
-    if not reviews:
-        return ReviewAnalysis(
-            summary="No reviews found for the selected period.",
-            sentiment=SentimentBreakdown(positive=0, negative=0, positive_share=0.0),
-            top_likes=[],
-            top_pain_points=[],
-            feature_requests=[],
-            monetization_mentions=[],
-            technical_issues=[],
-            notable_quotes=[],
-        )
-
-    llm_result = await _try_llm_analysis(reviews)
-    if llm_result is not None:
-        return llm_result
-    return fallback_analysis(reviews)
-
-
-async def _try_llm_analysis(reviews: list[SteamReview]) -> ReviewAnalysis | None:
-    api_key = os.getenv("LLM_API_KEY")
-    if not api_key:
-        return None
-
-    base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    model = os.getenv("LLM_MODEL", "gpt-4o-mini")
-    user_prompt = {
-        "task": "Analyze Steam reviews for game product analytics.",
-        "required_json_schema": {
-            "summary": "string: concise executive summary",
-            "top_likes": ["string"],
-            "top_pain_points": ["string"],
-            "feature_requests": ["string"],
-            "monetization_mentions": ["string"],
-            "technical_issues": ["string"],
-            "notable_quotes": ["string"],
-        },
-        "reviews": build_review_payload(reviews),
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
-                f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "temperature": 0.2,
-                    "response_format": {"type": "json_object"},
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
-                    ],
-                },
-            )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
-    except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError):
-        return None
-
-    sentiment = _sentiment_from_reviews(reviews)
-    return ReviewAnalysis(
-        summary=str(parsed.get("summary") or "LLM analysis completed."),
-        sentiment=sentiment,
-        top_likes=_string_list(parsed.get("top_likes")),
-        top_pain_points=_string_list(parsed.get("top_pain_points")),
-        feature_requests=_string_list(parsed.get("feature_requests")),
-        monetization_mentions=_string_list(parsed.get("monetization_mentions")),
-        technical_issues=_string_list(parsed.get("technical_issues")),
-        notable_quotes=_string_list(parsed.get("notable_quotes")),
-        raw_llm_response=parsed,
-    )
-
-
 def fallback_analysis(reviews: list[SteamReview]) -> ReviewAnalysis:
     sentiment = _sentiment_from_reviews(reviews)
     negative_reviews = [review.review for review in reviews if not review.voted_up]
@@ -120,8 +246,7 @@ def fallback_analysis(reviews: list[SteamReview]) -> ReviewAnalysis:
     return ReviewAnalysis(
         summary=(
             f"Analyzed {len(reviews)} reviews. Positive share is "
-            f"{sentiment.positive_share:.1%}. Fallback analysis is keyword-based; set LLM_API_KEY "
-            "for deeper theme extraction."
+            f"{sentiment.positive_share:.1%}. Fallback analysis is keyword-based; use Ollama or OpenAI for deeper theme extraction."
         ),
         sentiment=sentiment,
         top_likes=[f"Frequent positive terms: {', '.join(top_positive_terms)}"] if top_positive_terms else [],
@@ -131,6 +256,34 @@ def fallback_analysis(reviews: list[SteamReview]) -> ReviewAnalysis:
         technical_issues=technical_issues,
         notable_quotes=_notable_quotes(reviews),
     )
+
+
+def _parse_json_object(text: str) -> dict[str, Any] | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        parsed = json.loads(stripped)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    fenced = re.sub(r"^```(?:json)?|```$", "", stripped.strip(), flags=re.IGNORECASE | re.MULTILINE).strip()
+    try:
+        parsed = json.loads(fenced)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(stripped[start : end + 1])
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
 
 
 def _sentiment_from_reviews(reviews: list[SteamReview]) -> SentimentBreakdown:

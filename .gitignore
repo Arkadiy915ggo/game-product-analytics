@@ -17,6 +17,8 @@ htmlcov/
 # Build artifacts
 build/
 dist/
+.cache/
+reports/
 
 # IDE and OS files
 .idea/

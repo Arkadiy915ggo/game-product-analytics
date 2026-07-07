@@ -33,7 +33,7 @@ class ReviewAnalysisRequest(BaseModel):
     app_id: int | None = Field(default=None, description="Steam app id, if already known")
     start_date: date | None = Field(default=None, description="Inclusive review creation date")
     end_date: date | None = Field(default=None, description="Inclusive review creation date")
-    max_reviews: int = Field(default=200, ge=1, le=2000)
+    max_reviews: int = Field(default=100, ge=1, le=500)
     language: str = Field(default="all", description="Steam review language filter")
 
     @model_validator(mode="after")
